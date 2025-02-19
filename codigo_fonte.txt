@@ -1,0 +1,2094 @@
+==================================================
+              DOCUMENTAÇÃO CÓDIGO FONTE              
+==================================================
+
+Gerado em: 2025-02-19 06:39:59.009318
+Diretório raiz analisado: .
+
+--------------------------------------------------
+Nome do arquivo: core.py
+Caminho completo: .\core.py
+Tamanho (bytes): 43911
+Número de linhas: 1003
+--------------------------------------------------
+
+CÓDIGO FONTE:
+```python
+import hashlib
+import json
+import time
+from typing import List, Optional
+
+import pandas as pd
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ValidationError, field_validator
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric import padding
+
+import uvicorn
+import logging
+import sqlite3
+import os
+
+# Configuração de Logs
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s') #Mudado para DEBUG
+logger = logging.getLogger(__name__)
+
+DATABASE_FILE = "blockchain.db"  # Arquivo do banco de dados SQLite
+
+app = FastAPI()
+
+# CORS para permitir requisições de diferentes origens (localhost)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Em produção, restrinja as origens
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configurações
+MASTER_NODES = 3
+PORT = 17222  # Porta padrão
+DIFFICULTY = 4
+BLOCK_REWARD = 10  # Recompensa por minerar um bloco
+MIN_TRANSACTION_AMOUNT = 0.00000001 # Previne ataques de spam com micro transações
+GENESIS_ADDRESS = "Genesis" #Carteira Genesis
+BLOCKCHAIN_REWARD_ADDRESS = "BlockchainReward" # Endereço para recompensas de mineração
+
+# ------------------- Segurança RSA -------------------
+
+def generate_keys():
+    """Gera um par de chaves RSA (privada e pública)."""
+    try:
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+        public_key = private_key.public_key()
+
+        private_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+
+        public_pem = public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+
+        return private_pem.decode('utf-8'), public_pem.decode('utf-8')
+    except Exception as e:
+        logger.error(f"Erro ao gerar chaves RSA: {e}")
+        raise
+
+def load_key(key_string: str, private=False):
+    """Carrega uma chave RSA (privada ou pública) a partir de uma string."""
+    try:
+        key_bytes = key_string.encode('utf-8')
+        if private:
+            return serialization.load_pem_private_key(
+                key_bytes,
+                password=None,
+                backend=default_backend()
+            )
+        else:
+            return serialization.load_pem_public_key(
+                key_bytes,
+                backend=default_backend()
+            )
+    except Exception as e:
+        logger.error(f"Erro ao carregar chave RSA: {e}")
+        raise
+
+def sign_data(private_key_pem: str, data: str) -> bytes:
+    """Assina os dados fornecidos com a chave privada RSA."""
+    try:
+        private_key = load_key(private_key_pem, True)
+        message = data.encode('utf-8')
+        signature = private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return signature
+    except Exception as e:
+        logger.error(f"Erro ao assinar dados: {e}")
+        raise
+
+def verify_signature(public_key_pem: str, signature: bytes, data: str) -> bool:
+    """Verifica se a assinatura corresponde aos dados e à chave pública RSA."""
+    try:
+        public_key = load_key(public_key_pem)
+        message = data.encode('utf-8')
+        public_key.verify(
+            signature,
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return True
+    except InvalidSignature:
+        logger.warning("Assinatura inválida.")
+        return False
+    except Exception as e:
+        logger.error(f"Erro na verificação da assinatura: {e}")
+        return False
+
+# ------------------- Modelo de Dados -------------------
+
+class Transaction(BaseModel):
+    sender: str
+    recipient: str
+    amount: float
+    signature: str
+
+    def __hash__(self):  # Adiciona um hash para comparar transações
+        return hash((self.sender, self.recipient, self.amount, self.signature))
+
+    @field_validator('amount')
+    def amount_must_be_positive(cls, value):
+        if value <= MIN_TRANSACTION_AMOUNT:
+            raise ValueError(f'Amount must be greater than {MIN_TRANSACTION_AMOUNT}')
+        return value
+
+class Block(BaseModel):
+    index: int
+    timestamp: float
+    transactions: List[Transaction]
+    previous_hash: str
+    nonce: int
+    miner: str  # Adiciona o minerador do bloco
+    master_node_signatures: List[str]  # Lista de assinaturas dos nós mestres
+
+    def compute_hash(self):
+        """Calcula o hash SHA-256 do bloco."""
+        block_data = {
+            "index": self.index,
+            "timestamp": self.timestamp,
+            "transactions": [tx.dict() for tx in self.transactions],
+            "previous_hash": self.previous_hash,
+            "nonce": self.nonce,
+            "miner": self.miner,
+            "master_node_signatures": self.master_node_signatures
+        }
+        logger.debug(f"Block.compute_hash - block_data: {block_data}") # Log block_data before hashing #ADICIONADO LOG
+        # Serializa o dicionário para JSON e calcula o hash
+        block_string = json.dumps(block_data, sort_keys=True, ensure_ascii=False).encode('utf-8') # ensure_ascii=False
+        return hashlib.sha256(block_string).hexdigest()
+
+    def is_valid(self, previous_block: Optional["Block"] = None) -> bool:
+        """Valida o bloco, verificando índice, hash anterior, transações e PoW."""
+        if previous_block:
+            if self.index != previous_block.index + 1:
+                logger.error(f"Índice do bloco inválido. Esperado: {previous_block.index + 1}, Recebido: {self.index}")
+                return False
+            if self.previous_hash != previous_block.compute_hash():
+                logger.error(f"Hash do bloco anterior inválido.")
+                return False
+
+            #Verifica se as transações são validas
+            for transaction in self.transactions:
+                if not verify_transaction_signature(transaction):
+                    logger.error(f"Assinatura da transação inválida: {transaction}")
+                    return False
+
+        if not is_valid_proof(self):
+            logger.error("Proof-of-Work inválido.")
+            return False
+
+        return True
+
+class BlockchainState(BaseModel):
+    chain: List[Block]
+    pending_transactions: List[Transaction]
+    master_node_public_keys: dict
+
+class NodeRegistration(BaseModel):
+    public_key: str
+
+# ------------------- Estado da Blockchain (Em Memória e Banco) -------------------
+
+# Inicializa a blockchain com Pandas DataFrame
+blockchain_df = pd.DataFrame(columns=[
+    "block_index", "timestamp", "transactions", "previous_hash", "nonce", "miner", "hash", "master_node_signatures"
+])
+
+# Lista de transações pendentes
+pending_transactions: List[Transaction] = []
+
+# Lista de chaves publicas dos Master Nodes
+master_node_public_keys: List[str] = []
+
+# ------------------- Funções Blockchain -------------------
+
+def proof_of_work(block: Block) -> int:
+    """Executa o Proof-of-Work para encontrar um nonce válido para o bloco."""
+    block.nonce = 0
+    computed_hash = block.compute_hash()
+    while not computed_hash.startswith('0' * DIFFICULTY):
+        block.nonce += 1
+        computed_hash = block.compute_hash()
+    return block.nonce
+
+def create_genesis_block():
+    """Cria e adiciona o bloco Gênesis à blockchain."""
+    try:
+        global blockchain_df  # Declara que estamos usando a variável global
+
+        genesis_block = Block(
+            index=0,
+            timestamp=time.time(),
+            transactions=[],
+            previous_hash="0",
+            nonce=0,
+            miner=GENESIS_ADDRESS,
+            master_node_signatures=[]
+        )
+        genesis_block_hash = genesis_block.compute_hash()
+        add_block_to_blockchain(genesis_block, genesis_block_hash)
+        logger.info("Bloco Gênesis criado.")
+    except Exception as e:
+        logger.error(f"Erro ao criar bloco Gênesis: {e}")
+        raise
+
+def add_block_to_blockchain(block: Block, block_hash: str):
+    """Adiciona um bloco validado à blockchain e o persiste no banco de dados."""
+    try:
+        global blockchain_df  # Acessa a variável global
+
+        # Converte o bloco para um dicionário para salvar no DataFrame
+        block_data = {
+            "block_index": block.index,
+            "timestamp": block.timestamp,
+            "transactions": [tx.dict() for tx in block.transactions],  # Converte as transações para dicionários
+            "previous_hash": block.previous_hash,
+            "nonce": block.nonce,
+            "miner": block.miner,
+            "hash": block_hash,
+            "master_node_signatures": block.master_node_signatures
+        }
+
+        # Cria um novo DataFrame com os dados do bloco
+        new_block_df = pd.DataFrame([block_data])
+
+        # Concatena o novo DataFrame com o DataFrame da blockchain
+        blockchain_df = pd.concat([blockchain_df, new_block_df], ignore_index=True)
+
+        # Persiste no banco de dados
+        persist_block_to_db(block, block_hash)
+        logger.info(f"Bloco {block.index} adicionado à blockchain.")
+
+    except Exception as e:
+        logger.error(f"Erro ao adicionar bloco à blockchain: {e}")
+        raise
+
+def get_last_block() -> tuple[Optional[Block], Optional[str]]:
+    """Retorna o último bloco da blockchain e seu hash, ou None se a blockchain estiver vazia."""
+    try:
+        global blockchain_df
+
+        if len(blockchain_df) == 0:
+            return None, None # Blockchain vazia
+
+        # Obtem a ultima linha do DataFrame
+        last_block_series = blockchain_df.iloc[-1]
+
+        # Transforma a Series do pandas para dict para criar o modelo Block
+        last_block_dict = last_block_series.to_dict()
+        # Certifica-se de que 'index' está presente e é um int, renomeando 'block_index' para 'index'
+        if 'block_index' in last_block_dict:
+            last_block_dict['index'] = int(last_block_dict.pop('block_index')) # Renomeia e converte
+        else:
+            logger.error("Chave 'block_index' não encontrada no último bloco recuperado do DataFrame.")
+            return None, None
+
+        last_block = Block(**last_block_dict)
+        return last_block, last_block_series["hash"]
+    except Exception as e:
+        logger.error(f"Erro ao obter o último bloco: {e}")
+        return None, None
+
+def get_blockchain() -> List[Block]:
+    """Retorna a cadeia de blocos completa como uma lista de objetos Block."""
+    try:
+        global blockchain_df
+
+        if len(blockchain_df) == 0:
+            return [] # Blockchain vazia
+
+        chain = []
+        for _, row in blockchain_df.iterrows():
+            block_dict = row.to_dict()
+             # Certifica-se de que 'index' está presente e é um int, renomeando 'block_index' para 'index'
+            if 'block_index' in block_dict:
+                block_dict['index'] = int(block_dict.pop('block_index')) # Renomeia e converte
+            else:
+                logger.error("Chave 'block_index' não encontrada ao carregar bloco do DataFrame.")
+                continue # Pula este bloco se o índice estiver faltando
+
+            try:
+                block = Block(**block_dict)
+                chain.append(block)
+            except ValidationError as e:
+                logger.error(f"Erro de validação ao criar bloco do DataFrame: {e}")
+                continue # Pula blocos inválidos
+
+        return chain
+    except Exception as e:
+        logger.error(f"Erro ao obter a blockchain: {e}")
+        return []
+
+def add_pending_transaction(transaction: Transaction):
+    """Adiciona uma transação à lista de transações pendentes após validação."""
+    try:
+        global pending_transactions
+         #Validar assinatura da transação
+        if not verify_transaction_signature(transaction):
+            logger.error(f"Transação com assinatura inválida: {transaction}")
+            raise HTTPException(status_code=400, detail="Assinatura da transação inválida.")
+
+        #Validar saldo do remetente (exceto para transações Genesis)
+        if transaction.sender != GENESIS_ADDRESS:
+            sender_balance = calculate_balance(transaction.sender)
+            if sender_balance < transaction.amount:
+                 logger.error(f"Saldo insuficiente para a transação: {transaction}")
+                 raise HTTPException(status_code=400, detail="Saldo insuficiente.")
+        pending_transactions.append(transaction)
+        logger.info(f"Transação adicionada à lista pendente: {transaction}")
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Erro ao adicionar transação pendente: {e}")
+        raise
+
+def get_pending_transactions() -> List[Transaction]:
+    """Retorna a lista atual de transações pendentes."""
+    try:
+        global pending_transactions
+        return pending_transactions
+    except Exception as e:
+        logger.error(f"Erro ao obter transações pendentes: {e}")
+        return []
+
+def clear_pending_transactions(transactions: List[Transaction]):
+    """Remove uma lista de transações da lista de transações pendentes."""
+    try:
+        global pending_transactions
+        # Remova as transações fornecidas da lista pendente
+        pending_transactions = [tx for tx in pending_transactions if tx not in transactions]
+        logger.info("Lista de transações pendentes limpa.")
+    except Exception as e:
+        logger.error(f"Erro ao limpar transações pendentes: {e}")
+        raise
+
+def is_valid_chain(chain: List[Block]) -> bool:
+    """Valida a integridade de toda a cadeia de blocos."""
+    try:
+        if not chain: # Chain vazia é valida
+            return True
+        for i in range(1, len(chain)):
+            current_block = chain[i]
+            previous_block = chain[i - 1]
+
+            if not current_block.is_valid(previous_block):
+                logger.error(f"Bloco {current_block.index} é inválido.")
+                return False
+            if current_block.previous_hash != previous_block.compute_hash():
+                logger.error(f"Hash do bloco anterior inválido no bloco {current_block.index}.")
+                return False
+            # Removed DB hash check - relying on object hash and validation for now
+            # if current_block.compute_hash() != get_block_hash_from_db(current_block.index): #Verifica hash com o hash do DB
+            #      logger.error(f"Hash do bloco {current_block.index} não corresponde ao hash no banco de dados.")
+            #      return False
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao validar cadeia de blocos: {e}")
+        return False
+
+def get_block_hash_from_db(block_index: int) -> Optional[str]:
+    """Recupera o hash de um bloco específico do banco de dados pelo seu índice."""
+    try:
+        conn = connect_to_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT hash FROM blockchain WHERE block_index = ?", (block_index,))
+        result = cursor.fetchone()
+        if result:
+            return result[0]
+        return None
+    except sqlite3.Error as e:
+        logger.error(f"Erro ao obter hash do bloco do banco de dados: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def register_master_node(public_key: str):
+    """Registra a chave pública de um nó mestre, adicionando-a à lista e ao banco de dados."""
+    try:
+        global master_node_public_keys
+        if public_key not in master_node_public_keys:
+            master_node_public_keys.append(public_key)
+            persist_master_node_to_db(public_key)
+            logger.info(f"Nó mestre registrado com chave pública: {public_key}")
+        else:
+             logger.info(f"Nó mestre ja registrado: {public_key}")
+    except Exception as e:
+        logger.error(f"Erro ao registrar nó mestre: {e}")
+        raise
+
+def get_master_node_public_keys() -> List[str]:
+    """Retorna a lista de chaves públicas de todos os nós mestres registrados."""
+    try:
+        global master_node_public_keys
+        return master_node_public_keys
+    except Exception as e:
+        logger.error(f"Erro ao obter chaves públicas de nós mestres: {e}")
+        return []
+
+def is_valid_proof(block: Block) -> bool:
+    """Verifica se o hash do bloco satisfaz a condição de dificuldade do Proof-of-Work."""
+    try:
+        computed_hash = block.compute_hash()
+        return computed_hash.startswith('0' * DIFFICULTY)
+    except Exception as e:
+        logger.error(f"Erro ao validar Proof-of-Work: {e}")
+        return False
+
+def calculate_balance(address: str) -> float:
+    """Calcula o saldo de uma carteira, percorrendo a blockchain."""
+    try:
+        balance = 0.0
+        chain = get_blockchain()
+        for block in chain:
+            for transaction in block.transactions:
+                if transaction.recipient == address:
+                    balance += transaction.amount
+                if transaction.sender == address:
+                    balance -= transaction.amount
+        return balance
+    except Exception as e:
+        logger.error(f"Erro ao calcular saldo: {e}")
+        return 0.0
+
+def verify_transaction_signature(transaction: Transaction) -> bool:
+    """Verifica a assinatura de uma transação usando a chave pública do remetente."""
+    try:
+        # Transações Genesis não precisam de assinatura
+        if transaction.sender == GENESIS_ADDRESS:
+            return True
+
+        # Prepara os dados da transação para verificação (sem a assinatura)
+        data = f"{transaction.sender}{transaction.recipient}{transaction.amount}"
+        signature_bytes = bytes.fromhex(transaction.signature)
+
+        # Recupera a chave pública do remetente
+        public_key_pem = get_public_key_for_address(transaction.sender)
+
+        if not public_key_pem:
+            logger.warning(f"Chave pública não encontrada para o endereço: {transaction.sender}")
+            return False
+
+        return verify_signature(public_key_pem, signature_bytes, data)
+    except Exception as e:
+        logger.error(f"Erro ao verificar assinatura da transação: {e}")
+        return False
+
+# ------------------- Funções de persistencia no Banco de Dados -------------------
+
+def connect_to_db():
+    """Estabelece e retorna uma conexão com o banco de dados SQLite."""
+    conn = None # Inicializa conn fora do bloco try
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        logger.debug("Conectado ao banco de dados SQLite.") # Log de debug
+        return conn
+    except sqlite3.Error as e:
+        logger.error(f"Erro ao conectar ao banco de dados: {e}")
+        if conn: # Tenta fechar a conexão mesmo se falhou na abertura (limpeza)
+            conn.close()
+        raise
+
+def create_tables():
+    """Cria as tabelas `blockchain`, `master_nodes` e `wallet_keys` no banco de dados, se não existirem."""
+    conn = None # Garante que conn seja definido mesmo se a conexão falhar
+    try:
+        conn = connect_to_db()
+        cursor = conn.cursor()
+
+        # Tabela para a blockchain
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS blockchain (
+                block_index INTEGER PRIMARY KEY,
+                timestamp REAL NOT NULL,
+                transactions TEXT NOT NULL,
+                previous_hash TEXT NOT NULL,
+                nonce INTEGER NOT NULL,
+                miner TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                master_node_signatures TEXT
+            )
+        """)
+
+        # Tabela para nós mestres
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS master_nodes (
+                public_key TEXT PRIMARY KEY
+            )
+        """)
+
+        # Tabela para mapear endereços para chaves publicas
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_keys (
+                address TEXT PRIMARY KEY,
+                public_key TEXT NOT NULL
+            )
+        """)
+
+        conn.commit()
+        logger.info("Tabelas do banco de dados criadas/verificadas.")
+    except sqlite3.Error as e:
+        logger.error(f"Erro ao criar tabelas no banco de dados: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+def persist_block_to_db(block: Block, block_hash: str):
+    """Persiste os dados de um bloco no banco de dados."""
+    conn = None
+    try:
+        conn = connect_to_db()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO blockchain (block_index, timestamp, transactions, previous_hash, nonce, miner, hash, master_node_signatures)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            block.index,
+            block.timestamp,
+            json.dumps([tx.dict() for tx in block.transactions], ensure_ascii=False), # ensure_ascii=False
+            block.previous_hash,
+            block.nonce,
+            block.miner,
+            block_hash,
+            json.dumps(block.master_node_signatures, ensure_ascii=False) # ensure_ascii=False
+        ))
+        conn.commit()
+        logger.info(f"Bloco {block.index} persistido no banco de dados.")
+    except sqlite3.Error as e:
+        logger.error(f"Erro ao persistir bloco no banco de dados: {e} - Block Index: {block.index}, Hash: {block_hash}") # Adiciona info do bloco no log
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+def persist_master_node_to_db(public_key: str):
+    """Persiste a chave pública de um nó mestre no banco de dados."""
+    conn = None
+    try:
+        conn = connect_to_db()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO master_nodes (public_key)
+            VALUES (?)
+        """, (public_key,))
+        conn.commit()
+        logger.info(f"Nó mestre com chave pública {public_key} persistido no banco de dados.")
+    except sqlite3.Error as e:
+        logger.error(f"Erro ao persistir nó mestre no banco de dados: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+def load_master_nodes_from_db():
+    """Carrega as chaves públicas dos nós mestres do banco de dados para a lista em memória."""
+    conn = None
+    try:
+        conn = connect_to_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT public_key FROM master_nodes")
+        rows = cursor.fetchall()
+        global master_node_public_keys
+        master_node_public_keys = [row[0] for row in rows]
+        logger.info("Chaves públicas dos nós mestres carregadas do banco de dados.")
+    except sqlite3.Error as e:
+        logger.error(f"Erro ao carregar chaves públicas dos nós mestres do banco de dados: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+def get_public_key_for_address(address: str) -> Optional[str]:
+    """Retorna a chave pública associada a um endereço de carteira do banco de dados."""
+    conn = None
+    try:
+        conn = connect_to_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT public_key FROM wallet_keys WHERE address = ?", (address,))
+        result = cursor.fetchone()
+        if result:
+            return result[0]
+        return None
+    except sqlite3.Error as e:
+        logger.error(f"Erro ao obter chave pública do banco de dados: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def persist_wallet_key_pair_to_db(address: str, public_key: str):
+    """Persiste o par endereço-chave pública de uma carteira no banco de dados."""
+    conn = None
+    try:
+        conn = connect_to_db()
+        cursor = conn.cursor()
+
+        # Verifica se a carteira já existe
+        cursor.execute("SELECT address FROM wallet_keys WHERE address = ?", (address,))
+        if cursor.fetchone() is not None:
+             logger.warning(f"Carteira com endereço {address} já existe.")
+             raise HTTPException(status_code=400, detail=f"Carteira com endereço {address} já existe.")
+
+
+        cursor.execute("""
+            INSERT INTO wallet_keys (address, public_key)
+            VALUES (?, ?)
+        """, (address, public_key))
+        conn.commit()
+        logger.info(f"Chave publica para carteira {address} persistida no banco de dados.")
+    except HTTPException as e:
+        raise e #Re-lança a exception
+    except sqlite3.Error as e:
+        logger.error(f"Erro ao persistir chave publica no banco de dados: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+def load_blockchain_from_db():
+    """Carrega a blockchain completa do banco de dados para o DataFrame `blockchain_df`."""
+    global blockchain_df  # Garante que estamos acessando a variável global
+    blockchain_data = []  # Inicializa a lista *antes* do bloco try
+    conn = None
+    try:
+        conn = connect_to_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM blockchain ORDER BY block_index ASC")
+        rows = cursor.fetchall()
+
+        for row in rows:
+            block_index, timestamp, transactions_json, previous_hash, nonce, miner, hash, master_node_signatures_json = row
+            transactions = [Transaction(**tx) for tx in json.loads(transactions_json)]
+            master_node_signatures = json.loads(master_node_signatures_json) if master_node_signatures_json else []
+
+            blockchain_data.append({
+                "block_index": block_index,
+                "timestamp": timestamp,
+                "transactions": transactions,
+                "previous_hash": previous_hash,
+                "nonce": nonce,
+                "miner": miner,
+                "hash": hash,
+                "master_node_signatures": master_node_signatures
+            })
+
+        blockchain_df = pd.DataFrame(blockchain_data)
+        logger.info("Blockchain carregada do banco de dados para o DataFrame.")
+    except sqlite3.Error as e:
+        logger.error(f"Erro ao carregar blockchain do banco de dados: {e}")
+        blockchain_df = pd.DataFrame(columns=[ # Garante DF vazio em caso de erro
+            "block_index", "timestamp", "transactions", "previous_hash", "nonce", "miner", "hash", "master_node_signatures"
+        ])
+    finally:
+        if conn:
+            conn.close()
+
+# ------------------- Rotas FastAPI -------------------
+
+class NodeRegistration(BaseModel):
+    public_key: str
+
+@app.post("/register_node")
+async def register_node(registration: NodeRegistration):
+    """Rota para registrar um novo nó mestre."""
+    logger.info("Rota /register_node acessada.")
+    try:
+        register_master_node(registration.public_key)
+        return {"message": "Nó mestre registrado com sucesso."}
+    except Exception as e:
+        logger.error(f"Erro ao registrar nó mestre: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/blockchain", response_model=List[Block])
+async def get_chain():
+    """Rota para retornar a blockchain completa."""
+    logger.info("Rota /blockchain acessada.")
+    return get_blockchain()
+
+@app.post("/transaction")
+async def add_transaction(transaction: Transaction):
+    """Rota para adicionar uma nova transação à lista de transações pendentes."""
+    logger.info(f"Rota /transaction acessada. Transação: {transaction}")
+    try:
+        add_pending_transaction(transaction)
+        return {"message": "Transação adicionada à lista pendente."}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Erro ao adicionar transação: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class BlockConfirmation(BaseModel):
+    block: Block
+    block_hash: str
+    signature: str
+    public_key: str
+
+pending_block_confirmations = {}
+
+@app.post("/confirm_block")
+async def confirm_block(confirmation: BlockConfirmation):
+    """Rota para confirmar um bloco minerado por um nó mestre."""
+    logger.info("Rota /confirm_block acessada.")
+    try:
+        block = confirmation.block
+        received_block_hash = confirmation.block_hash # Use received_block_hash here
+        signature = confirmation.signature
+        public_key = confirmation.public_key
+
+        logger.debug(f"Bloco recebido para confirmação: {block.index}")
+        logger.debug(f"Hash recebido: {received_block_hash}") # Debug received_block_hash
+        logger.debug(f"Assinatura recebida: {signature}")
+        logger.debug(f"Chave pública recebida: {public_key}")
+
+        # 0. Valida se o nó mestre esta registrado
+        master_node_keys = get_master_node_public_keys()
+        if public_key not in master_node_keys:
+            raise HTTPException(status_code=403, detail="Chave pública não autorizada.")
+
+        # 1. Verifique a assinatura do nó mestre
+        signature_bytes = bytes.fromhex(signature) # Transforma de volta para bytes
+        if not verify_signature(public_key, signature_bytes, received_block_hash): # Verifique a assinatura usando o received_block_hash
+            raise HTTPException(status_code=400, detail="Assinatura do nó mestre inválida.")
+
+        # 2. Verifique o hash do bloco (usando o hash recebido!)
+        if received_block_hash != block.compute_hash(): # Compare against received_block_hash
+            raise HTTPException(status_code=400, detail="Hash do bloco inválido.")
+
+        # 3. Verifique o PoW
+        if not is_valid_proof(block):
+            raise HTTPException(status_code=400, detail="Proof-of-Work inválido.")
+
+        # 4. Valida o bloco em si (index, previous_hash, transações)
+        last_block, last_block_hash = get_last_block()
+
+        if last_block is None: # Trata o caso de blockchain vazia (antes do genesis?)
+            if block.index != 0: # Se não for o bloco genesis, invalido
+                raise HTTPException(status_code=400, detail="Bloco inválido: Blockchain vazia, esperado bloco Genesis.")
+        elif block.index != last_block.index + 1: # Verifica a ordem correta do bloco
+            raise HTTPException(status_code=400, detail=f"Bloco fora de ordem. Esperado índice: {last_block.index + 1}, recebido: {block.index}")
+        elif not block.is_valid(last_block): # Valida normalmente se ja tem bloco genesis
+             raise HTTPException(status_code=400, detail="Bloco inválido: Validação do bloco falhou.")
+
+
+        # 5. Lógica de Consenso (2/3 dos nós mestres)
+        block_key = block.index  # Identificador único para o bloco
+
+        # Verifica se já existe um bloco confirmado com este índice (evitar duplicados)
+        current_chain = get_blockchain()
+        if any(b.index == block.index for b in current_chain):
+            raise HTTPException(status_code=409, detail=f"Bloco com índice {block.index} já foi confirmado e adicionado.")
+
+
+        # Armazena as informações do bloco e a assinatura do nó mestre
+        if block_key not in pending_block_confirmations:
+            pending_block_confirmations[block_key] = {
+                "block": block,
+                "block_hash": received_block_hash, # Store received_block_hash
+                "signatures": [],
+                "public_keys": []
+            }
+
+        # Adiciona a assinatura e a chave pública do nó mestre que confirmou
+        if public_key not in pending_block_confirmations[block_key]["public_keys"]: # Evita confirmações duplicadas do mesmo nó
+            pending_block_confirmations[block_key]["signatures"].append(signature)
+            pending_block_confirmations[block_key]["public_keys"].append(public_key)
+            logger.info(f"Confirmação do bloco {block.index} recebida do nó mestre {public_key[:20]}...") # Log mais detalhado
+
+        else:
+            logger.warning(f"Confirmação duplicada do nó mestre {public_key[:20]}... para o bloco {block.index} ignorada.")
+            return {"message": f"Confirmação duplicada recebida e ignorada."}
+
+
+        # Verifica se o consenso foi atingido (mais de 2/3 dos nós mestres únicos)
+        unique_public_keys = set(pending_block_confirmations[block_key]["public_keys"])
+        if len(unique_public_keys) >= (2 * MASTER_NODES) / 3:  # Mais de 2/3
+            logger.info(f"Consenso atingido para o bloco {block.index} com {len(unique_public_keys)} confirmações.") # Log de consenso atingido
+            # Validar e adicionar o bloco
+            block_to_add = pending_block_confirmations[block_key]["block"]
+            signatures_for_block = pending_block_confirmations[block_key]["signatures"] # Pega as assinaturas coletadas
+            stored_block_hash = pending_block_confirmations[block_key]["block_hash"] # Get stored_block_hash
+
+            if validate_and_add_block(block_to_add, stored_block_hash, signatures_for_block, list(unique_public_keys)): # Pass stored_block_hash
+                # Dar a recompensa ao minerador
+                reward_transaction = Transaction(sender=BLOCKCHAIN_REWARD_ADDRESS, recipient=block.miner, amount=BLOCK_REWARD, signature="") # Recompensa vem do endereço de recompensa
+                add_pending_transaction(reward_transaction)
+
+                # Limpar as transações pendentes que foram incluídas no bloco
+                clear_pending_transactions(block.transactions)
+                del pending_block_confirmations[block_key] # Limpa confirmações pendentes para este bloco
+                return {"message": f"Bloco {block.index} adicionado à blockchain com consenso."}
+            else:
+                # Se validate_and_add_block falhar, algo inesperado aconteceu (já validamos antes!)
+                logger.error(f"Falha ao validar e adicionar bloco {block.index} APÓS consenso! Verifique logs de validate_and_add_block.")
+                raise HTTPException(status_code=500, detail="Erro ao adicionar bloco após consenso (validação falhou).")
+        else:
+            # Consenso não atingido ainda
+            faltam = (2*MASTER_NODES/3) - len(unique_public_keys)
+            logger.info(f"Confirmação recebida para o bloco {block.index}. Faltam {faltam} confirmações para atingir o consenso. Atualmente: {len(unique_public_keys)}") # Log de progresso do consenso
+            return {"message": f"Confirmação recebida para o bloco {block.index}. Faltam {int(faltam)} confirmações para atingir o consenso.", "confirmations_received": len(unique_public_keys), "confirmations_needed": int(2*MASTER_NODES/3)}
+
+    except ValidationError as e:
+        logger.error(f"Erro de validação ao confirmar bloco: {e}")
+        raise HTTPException(status_code=422, detail=str(e))  # Retorna 422 para erros de validação
+    except HTTPException as e:
+        raise e  # Re-raise HTTPExceptions para manter o código de status
+    except Exception as e:
+        logger.error(f"Erro ao confirmar bloco: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro interno ao confirmar bloco: {e}")
+
+def validate_and_add_block(block: Block, received_block_hash: str, signatures: List[str], public_keys_signers: List[str]) -> bool: # Renamed block_hash to received_block_hash
+    """Valida um bloco (novamente, após consenso) e, se válido, adiciona-o à blockchain."""
+    try:
+        last_block, last_block_hash = get_last_block()
+
+        block.master_node_signatures = signatures # Add signatures to the block object NOW
+        computed_block_hash = block.compute_hash() # Compute hash AFTER adding signatures
+
+        logger.debug(f"validate_and_add_block - Validating block index: {block.index}, received_block_hash: {received_block_hash}") # Debug received_block_hash
+        logger.debug(f"validate_and_add_block - Computed block hash (with signatures): {computed_block_hash}") # Debug computed_block_hash
+
+        # --- ADDED LOGGING ---
+        block_data_validate = { # Reconstruct block_data to log
+            "index": block.index,
+            "timestamp": block.timestamp,
+            "transactions": [tx.dict() for tx in block.transactions],
+            "previous_hash": block.previous_hash,
+            "nonce": block.nonce,
+            "miner": block.miner,
+            "master_node_signatures": block.master_node_signatures
+        }
+        logger.debug(f"validate_and_add_block - block_data for compute_hash: {block_data_validate}") # Log block_data in validation
+
+        # --- Get block_data from the Block object to compare ---
+        block_data_received_dict = block.dict() # Get dict from Block object
+        block_string_received = json.dumps(block_data_received_dict, sort_keys=True, ensure_ascii=False) # Serialize to JSON string
+        block_string_computed = json.dumps(block_data_validate, sort_keys=True, ensure_ascii=False) # Serialize again for comparison
+
+        logger.debug(f"validate_and_add_block - JSON String Received Block   : {block_string_received}") # Log JSON string of received block
+        logger.debug(f"validate_and_add_block - JSON String Computed Block  : {block_string_computed}") # Log JSON string of computed block
+
+        if block_string_received != block_string_computed: # COMPARE JSON STRINGS!
+            logger.error(f"validate_and_add_block - JSON STRINGS OF BLOCK DATA ARE DIFFERENT! Data Mismatch!") # CRITICAL Data Mismatch Log
+        else:
+            logger.debug(f"validate_and_add_block - JSON STRINGS OF BLOCK DATA ARE IDENTICAL. Data Matches.") # Data Match Log
+
+        # --- END EVEN MORE DETAILED LOGGING AND DATA COMPARISON ---
+
+
+        if last_block is None: # Blockchain vazia (genesis)
+            if block.index != 0:
+                logger.error("Bloco inválido: Blockchain vazia, esperado bloco Genesis.")
+                return False
+        # Removed redundant block.is_valid(last_block) check here as it's already done in confirm_block route
+
+        if received_block_hash != computed_block_hash: # Compare against received_block_hash
+            logger.error(f"Hash do bloco inválido. Recebido: {received_block_hash}, Computado: {computed_block_hash}") # More detailed error log
+            logger.error(f"Bloco para validação: {block.dict()}") # Log the block content for inspection
+            return False
+
+        if len(signatures) < (2* MASTER_NODES/3):
+            logger.error("Número insuficiente de assinaturas para o consenso (em validate_and_add_block).")
+            return False
+
+
+        add_block_to_blockchain(block, computed_block_hash) # Add block with computed_block_hash
+        logger.info(f"Bloco {block.index} adicionado à blockchain com {len(signatures)} assinaturas de nós mestres: {public_keys_signers}") # Log with signing keys
+        return True
+
+    except Exception as e:
+        logger.error(f"Erro ao validar e adicionar bloco (validate_and_add_block): {e}")
+        return False
+
+@app.get("/master_nodes")
+async def list_master_nodes():
+    """Rota para listar as chaves públicas dos nós mestres registrados."""
+    logger.info("Rota /master_nodes acessada.")
+    return get_master_node_public_keys()
+
+@app.get("/pending_transactions", response_model=List[Transaction])
+async def get_pending_tx():
+    """Rota para retornar a lista de transações pendentes."""
+    logger.info("Rota /pending_transactions acessada.")
+    return get_pending_transactions()
+
+@app.get("/balance/{address}")
+async def get_balance(address: str):
+    """Rota para consultar o saldo de uma carteira."""
+    logger.info(f"Rota /balance/{address} acessada.")
+    try:
+        balance = calculate_balance(address)
+        return {"address": address, "balance": balance}
+    except Exception as e:
+        logger.error(f"Erro ao obter saldo: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/register_wallet")
+async def register_wallet(address: str, public_key: str):
+    """Rota para registrar uma nova carteira, associando um endereço a uma chave pública."""
+    logger.info("Rota /register_wallet acessada.")
+    try:
+        persist_wallet_key_pair_to_db(address, public_key)
+        return {"message": "Carteira registrada com sucesso."}
+    except HTTPException as e:
+        raise e  # Re-raise HTTPExceptions para manter o código de status
+    except Exception as e:
+        logger.error(f"Erro ao registrar carteira: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/get_public_key/{address}")
+async def get_public_key_route(address: str):
+    """Rota para obter a chave pública de um endereço de carteira."""
+    logger.info(f"Rota /get_public_key/{address} acessada.")
+    try:
+        public_key = get_public_key_for_address(address)
+        if public_key:
+            return {"public_key": public_key}
+        else:
+            raise HTTPException(status_code=404, detail="Chave pública não encontrada para este endereço.")
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Erro ao obter chave pública para {address}: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao obter chave pública.")
+
+
+# ------------------- Inicialização -------------------
+
+def initialize():
+    """Função de inicialização do aplicativo, cria tabelas, carrega dados e cria o bloco Genesis se necessário."""
+    logger.info("Inicializando...") # Log no inicio da inicialização
+    try:
+        create_tables()
+        load_master_nodes_from_db()
+        load_blockchain_from_db()
+
+        global blockchain_df  # Garante que estamos acessando a variável global
+        if blockchain_df.empty: # Verificação se o DataFrame está vazio (melhor que len(blockchain_df) == 0 para pandas)
+            logger.info("Blockchain DataFrame vazio. Criando bloco Genesis...")
+            create_genesis_block()
+        else:
+            logger.info(f"Blockchain carregada do banco de dados. Tamanho da cadeia: {len(blockchain_df)}") # Log com tamanho da cadeia carregada
+        logger.info("Inicialização completa.")
+    except Exception as e:
+        logger.critical(f"Falha na inicialização: {e}")
+        raise  # Re-raise para impedir a inicialização do Uvicorn
+
+# ------------------- Execução do Uvicorn -------------------
+if __name__ == "__main__":
+    try:
+        initialize()
+        logger.info(f"Iniciando o servidor Uvicorn na porta {PORT}...")
+        uvicorn.run("core:app", host="0.0.0.0", port=PORT, reload=True)
+    except Exception as e:
+        logger.critical(f"Erro ao iniciar Uvicorn: {e}")
+```
+
+DOCUMENTAÇÃO (Docstrings):
+  def generate_keys:
+    Gera um par de chaves RSA (privada e pública).
+  def load_key:
+    Carrega uma chave RSA (privada ou pública) a partir de uma string.
+  def sign_data:
+    Calcula o hash SHA-256 do bloco.
+  def is_valid:
+    Cria e adiciona o bloco Gênesis à blockchain.
+  def add_block_to_blockchain:
+    Adiciona um bloco validado à blockchain e o persiste no banco de dados.
+  def get_last_block:
+    Adiciona uma transação à lista de transações pendentes após validação.
+  def get_pending_transactions:
+    Remove uma lista de transações da lista de transações pendentes.
+  def is_valid_chain:
+    Registra a chave pública de um nó mestre, adicionando-a à lista e ao banco de dados.
+  def get_master_node_public_keys:
+    Estabelece e retorna uma conexão com o banco de dados SQLite.
+  def create_tables:
+    Cria as tabelas `blockchain`, `master_nodes` e `wallet_keys` no banco de dados, se não existirem.
+  def persist_block_to_db:
+    Persiste os dados de um bloco no banco de dados.
+  def persist_master_node_to_db:
+    Persiste a chave pública de um nó mestre no banco de dados.
+  def load_master_nodes_from_db:
+    Carrega as chaves públicas dos nós mestres do banco de dados para a lista em memória.
+  def get_public_key_for_address:
+    Persiste o par endereço-chave pública de uma carteira no banco de dados.
+  def load_blockchain_from_db:
+    Carrega a blockchain completa do banco de dados para o DataFrame `blockchain_df`.
+  class NodeRegistration:
+    Rota para registrar um novo nó mestre.
+  def get_chain:
+    Rota para retornar a blockchain completa.
+  def add_transaction:
+    Rota para adicionar uma nova transação à lista de transações pendentes.
+  class BlockConfirmation:
+    Rota para confirmar um bloco minerado por um nó mestre.
+  def validate_and_add_block:
+    Rota para listar as chaves públicas dos nós mestres registrados.
+  def get_pending_tx:
+    Rota para retornar a lista de transações pendentes.
+  def get_balance:
+    Rota para consultar o saldo de uma carteira.
+  def register_wallet:
+    Rota para registrar uma nova carteira, associando um endereço a uma chave pública.
+  def get_public_key_route:
+    Rota para obter a chave pública de um endereço de carteira.
+  def initialize:
+    Função de inicialização do aplicativo, cria tabelas, carrega dados e cria o bloco Genesis se necessário.
+
+--------------------------------------------------
+Nome do arquivo: documenta-projeto-v1.py
+Caminho completo: .\documenta-projeto-v1.py
+Tamanho (bytes): 5738
+Número de linhas: 123
+--------------------------------------------------
+
+CÓDIGO FONTE:
+```python
+import os
+import glob
+import re
+
+def analisar_arquivo_py(caminho_arquivo):
+    """
+    Analisa um arquivo Python e retorna informações sobre ele.
+
+    Args:
+        caminho_arquivo (str): O caminho para o arquivo Python.
+
+    Returns:
+        dict: Um dicionário contendo informações como nome do arquivo, tamanho,
+              número de linhas e o código fonte.  Retorna None se o arquivo não existir.
+    """
+    try:
+        with open(caminho_arquivo, 'r', encoding='utf-8') as arquivo:
+            codigo_fonte = arquivo.read()
+            numero_linhas = len(codigo_fonte.splitlines())
+            tamanho_bytes = os.path.getsize(caminho_arquivo)  # Tamanho em bytes
+
+            return {
+                'nome_arquivo': os.path.basename(caminho_arquivo),
+                'tamanho_bytes': tamanho_bytes,
+                'numero_linhas': numero_linhas,
+                'codigo_fonte': codigo_fonte,
+            }
+    except FileNotFoundError:
+        print(f"Arquivo não encontrado: {caminho_arquivo}")
+        return None
+    except Exception as e:
+        print(f"Erro ao ler o arquivo {caminho_arquivo}: {e}")
+        return None
+
+def gerar_documentacao(caminho_raiz='.'):
+    """
+    Gera um arquivo de documentação "codigo_fonte.txt" que lista todos os arquivos
+    Python na raiz especificada (e suas subpastas), juntamente com informações
+    sobre cada arquivo e seu código fonte.  Também tenta criar uma documentação
+    básica a partir de docstrings.
+
+    Args:
+        caminho_raiz (str): O caminho para o diretório raiz a ser analisado.
+                             O padrão é o diretório atual ('.').
+    """
+
+    arquivos_py = glob.glob(os.path.join(caminho_raiz, '**/*.py'), recursive=True)
+
+    with open('codigo_fonte.txt', 'w', encoding='utf-8') as arquivo_saida:
+        # Cabeçalho do arquivo de documentação
+        arquivo_saida.write("==================================================\n")
+        arquivo_saida.write("              DOCUMENTAÇÃO CÓDIGO FONTE              \n")
+        arquivo_saida.write("==================================================\n\n")
+        arquivo_saida.write(f"Gerado em: {datetime.datetime.now()}\n")
+        arquivo_saida.write(f"Diretório raiz analisado: {caminho_raiz}\n\n")
+
+        for caminho_arquivo in arquivos_py:
+            info_arquivo = analisar_arquivo_py(caminho_arquivo)
+
+            if info_arquivo:
+                arquivo_saida.write("--------------------------------------------------\n")
+                arquivo_saida.write(f"Nome do arquivo: {info_arquivo['nome_arquivo']}\n")
+                arquivo_saida.write(f"Caminho completo: {caminho_arquivo}\n") #adicionado caminho completo
+                arquivo_saida.write(f"Tamanho (bytes): {info_arquivo['tamanho_bytes']}\n")
+                arquivo_saida.write(f"Número de linhas: {info_arquivo['numero_linhas']}\n")
+                arquivo_saida.write("--------------------------------------------------\n\n")
+
+                arquivo_saida.write("CÓDIGO FONTE:\n")
+                arquivo_saida.write("```python\n")
+                arquivo_saida.write(info_arquivo['codigo_fonte'])
+                arquivo_saida.write("\n```\n\n")
+
+                # Extrair e adicionar docstrings (documentação básica)
+                arquivo_saida.write("DOCUMENTAÇÃO (Docstrings):\n")
+                docstrings = extrair_docstrings(info_arquivo['codigo_fonte'])
+                if docstrings:
+                    for nome, docstring in docstrings.items():
+                        arquivo_saida.write(f"  {nome}:\n")
+                        arquivo_saida.write(f"    {docstring.strip()}\n")  # Remover espaços extras
+                else:
+                    arquivo_saida.write("  Nenhuma docstring encontrada.\n")
+                arquivo_saida.write("\n")
+            else:
+                arquivo_saida.write(f"Erro ao processar o arquivo: {caminho_arquivo}\n\n")
+
+        arquivo_saida.write("==================================================\n")
+        arquivo_saida.write("              FIM DA DOCUMENTAÇÃO                   \n")
+        arquivo_saida.write("==================================================\n")
+
+
+def extrair_docstrings(codigo_fonte):
+    """
+    Extrai docstrings de funções e classes do código fonte.
+
+    Args:
+        codigo_fonte (str): O código fonte Python.
+
+    Returns:
+        dict: Um dicionário onde as chaves são os nomes das funções/classes
+              e os valores são as suas docstrings correspondentes.
+              Retorna um dicionário vazio se nenhuma docstring for encontrada.
+    """
+    docstrings = {}
+    # Padrão para encontrar definições de funções e classes com docstrings
+    padrao = r"(def|class)\s+(\w+)\s*\(.*?\):\s*(\"\"\"(.*?)\"\"\"|'''(.*?)''')"
+    correspondencias = re.findall(padrao, codigo_fonte, re.DOTALL)  # re.DOTALL para multilinhas
+
+    for tipo, nome, _, docstring_aspas_triplas, docstring_pluma in correspondencias:
+        docstring = docstring_aspas_triplas or docstring_pluma  # Escolher qual docstring usar
+        docstrings[f"{tipo} {nome}"] = docstring
+
+    return docstrings
+
+
+if __name__ == "__main__":
+    import datetime  # Importar datetime aqui para usar dentro da função gerar_documentacao
+
+    # Chame a função para gerar a documentação, definindo o diretório raiz
+    # Se quiser analisar a pasta atual, use apenas gerar_documentacao()
+    gerar_documentacao() # analisa a pasta atual
+    #gerar_documentacao('/caminho/para/sua/pasta') # Substitua pelo caminho real, se necessário
+
+    print("Documentação gerada em 'codigo_fonte.txt'")
+```
+
+DOCUMENTAÇÃO (Docstrings):
+  def analisar_arquivo_py:
+    Analisa um arquivo Python e retorna informações sobre ele.
+
+    Args:
+        caminho_arquivo (str): O caminho para o arquivo Python.
+
+    Returns:
+        dict: Um dicionário contendo informações como nome do arquivo, tamanho,
+              número de linhas e o código fonte.  Retorna None se o arquivo não existir.
+  def gerar_documentacao:
+    Gera um arquivo de documentação "codigo_fonte.txt" que lista todos os arquivos
+    Python na raiz especificada (e suas subpastas), juntamente com informações
+    sobre cada arquivo e seu código fonte.  Também tenta criar uma documentação
+    básica a partir de docstrings.
+
+    Args:
+        caminho_raiz (str): O caminho para o diretório raiz a ser analisado.
+                             O padrão é o diretório atual ('.').
+  def extrair_docstrings:
+    Extrai docstrings de funções e classes do código fonte.
+
+    Args:
+        codigo_fonte (str): O código fonte Python.
+
+    Returns:
+        dict: Um dicionário onde as chaves são os nomes das funções/classes
+              e os valores são as suas docstrings correspondentes.
+              Retorna um dicionário vazio se nenhuma docstring for encontrada.
+
+--------------------------------------------------
+Nome do arquivo: testerv1.py
+Caminho completo: .\testerv1.py
+Tamanho (bytes): 12327
+Número de linhas: 270
+--------------------------------------------------
+
+CÓDIGO FONTE:
+```python
+import requests
+import time
+import hashlib
+import json
+import os
+import yaml  # Import PyYAML
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+
+from rich.console import Console
+from rich.rule import Rule
+from rich.progress import Progress
+from rich.text import Text
+from rich.panel import Panel
+from rich.style import Style
+
+# Initialize Rich Console
+console = Console(force_terminal=True, color_system="truecolor")
+
+# Endereço da API da blockchain
+API_URL = "http://localhost:17222"  # Ajuste se necessário
+
+# Nome dos arquivos para salvar os dados
+WALLETS_FILE_JSON = "wallets_v2.json"
+WALLETS_FILE_YAML = "wallets_v2.yaml"
+TRANSACTIONS_FILE_JSON = "transactions_v2.json"
+TRANSACTIONS_FILE_YAML = "transactions_v2.yaml"
+
+def generate_keys():
+    """Gera um par de chaves RSA (privada e pública)."""
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+    public_key = private_key.public_key()
+
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+
+    public_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+
+    return private_pem.decode('utf-8'), public_pem.decode('utf-8')
+
+def load_key(key_string: str, private=False):
+    """Carrega uma chave RSA (privada ou pública) a partir de uma string."""
+    key_bytes = key_string.encode('utf-8')
+    if private:
+        return serialization.load_pem_private_key(
+            key_bytes,
+            password=None,
+            backend=default_backend()
+        )
+    else:
+        return serialization.load_pem_public_key(
+            key_bytes,
+            backend=default_backend()
+        )
+
+def sign_data(private_key_pem: str, data: str) -> bytes:
+    """Assina dados com a chave privada."""
+    private_key = load_key(private_key_pem, True)
+    message = data.encode('utf-8')
+    signature = private_key.sign(
+        message,
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.MAX_LENGTH
+        ),
+        hashes.SHA256()
+    )
+    return signature
+
+def register_wallet(address, public_key):
+    """Registra uma carteira na blockchain."""
+    console.print(f":key: [bold blue]Registering wallet[/bold blue] [bold magenta]{address}[/bold magenta]...", end=" ")
+    try:
+        response = requests.post(f"{API_URL}/register_wallet?address={address}&public_key={public_key}")
+        response.raise_for_status()
+        console.print(f"[bold green]Success[/bold green] :check_mark_button:")
+        return True
+    except requests.exceptions.RequestException as e:
+        console.print(f"[bold red]Error[/bold red] :cross_mark: - [italic]{e}[/italic]")
+        return False
+
+def create_transaction(sender_private_key, sender_address, recipient_address, amount):
+    """Cria e envia uma transação assinada para a blockchain."""
+    console.print(f":arrow_right: [bold cyan]Creating transaction[/bold cyan] from [bold magenta]{sender_address}[/bold magenta] to [bold magenta]{recipient_address}[/bold magenta] amount [bold green]{amount}[/bold green]...", end=" ")
+
+    # Se for a transação Genesis, não assina
+    if sender_address == "Genesis":
+        signature = ""
+    else:
+        data = f"{sender_address}{recipient_address}{amount}"
+        signature = sign_data(sender_private_key, data).hex()
+
+    transaction_data = {
+        "sender": sender_address,
+        "recipient": recipient_address,
+        "amount": amount,
+        "signature": signature
+    }
+
+    try:
+        response = requests.post(f"{API_URL}/transaction", json=transaction_data)
+        response.raise_for_status()
+        console.print(f"[bold green]Sent[/bold green] :check_mark_button:")
+        return transaction_data
+    except requests.exceptions.RequestException as e:
+        console.print(f"[bold red]Error[/bold red] :cross_mark: - [italic]{e}[/italic]")
+        return None
+
+def wait_for_block():
+    """Espera até que um novo bloco seja minerado com Rich Progress Bar."""
+    console.print("[bold yellow]:hourglass: Waiting for a new block to be mined...[/bold yellow]")
+    with Progress(transient=True) as progress:
+        task_id = progress.add_task("[cyan]Mining...", total=None)
+        initial_chain = requests.get(f"{API_URL}/blockchain").json()
+        initial_length = len(initial_chain)
+        while True:
+            current_chain = requests.get(f"{API_URL}/blockchain").json()
+            if len(current_chain) > initial_length:
+                progress.update(task_id, advance=100, total=100, visible=False)  # Finish progress bar
+                break
+            time.sleep(1) # Reduced sleep for faster feedback
+    console.print("[bold green]:sparkles: New block mined![/bold green]")
+
+def load_wallets():
+    """Carrega as carteiras do arquivo JSON e YAML."""
+    wallets_json = {}
+    wallets_yaml = {}
+    try:
+        with open(WALLETS_FILE_JSON, 'r', encoding='utf-8') as f_json:
+            wallets_json = json.load(f_json)
+    except FileNotFoundError:
+        pass # Arquivo JSON não encontrado, não é um erro fatal
+    except json.JSONDecodeError:
+        console.print(f"[bold yellow]:warning_sign: Warning:[/bold yellow] Error decoding [bold magenta]{WALLETS_FILE_JSON}[/bold magenta]. Creating a new one.")
+
+    try:
+        with open(WALLETS_FILE_YAML, 'r', encoding='utf-8') as f_yaml:
+            wallets_yaml = yaml.safe_load(f_yaml) or {} # yaml.safe_load can return None
+    except FileNotFoundError:
+        pass # Arquivo YAML não encontrado, não é um erro fatal
+    except yaml.YAMLError:
+        console.print(f"[bold yellow]:warning_sign: Warning:[/bold yellow] Error decoding [bold magenta]{WALLETS_FILE_YAML}[/bold magenta]. Creating a new one.")
+
+    # Merge wallets, JSON takes precedence if keys overlap
+    wallets = {**wallets_yaml, **wallets_json} # Merge dicts, JSON overwrites YAML in case of overlap
+
+    return wallets
+
+def save_wallets(wallets):
+    """Salva as carteiras nos arquivos JSON e YAML com UTF-8 encoding."""
+    with open(WALLETS_FILE_JSON, 'w', encoding='utf-8') as f_json:
+        json.dump(wallets, f_json, indent=4, ensure_ascii=False) # ensure_ascii=False for UTF-8
+    console.print(f":floppy_disk: Wallets saved to [bold magenta]{WALLETS_FILE_JSON}[/bold magenta]")
+
+    with open(WALLETS_FILE_YAML, 'w', encoding='utf-8') as f_yaml:
+        yaml.dump(wallets, f_yaml, indent=2, allow_unicode=True) # allow_unicode=True for UTF-8
+    console.print(f":floppy_disk: Wallets saved to [bold magenta]{WALLETS_FILE_YAML}[/bold magenta]")
+
+def save_transactions_data(transactions, filename_json, filename_yaml):
+    """Salva os dados das transações em JSON e YAML com UTF-8."""
+    with open(filename_json, 'w', encoding='utf-8') as f_json:
+        json.dump(transactions, f_json, indent=4, ensure_ascii=False)
+    console.print(f":floppy_disk: Transactions saved to [bold magenta]{filename_json}[/bold magenta]")
+
+    with open(filename_yaml, 'w', encoding='utf-8') as f_yaml:
+        yaml.dump(transactions, f_yaml, indent=2, allow_unicode=True)
+    console.print(f":floppy_disk: Transactions saved to [bold magenta]{filename_yaml}[/bold magenta]")
+
+
+if __name__ == "__main__":
+    console.rule(Text("Starting Tester v2 - Improved & Corrected", style="bold blue")) # More descriptive title
+
+    # Carrega as carteiras existentes
+    wallets = load_wallets()
+    console.print(":file_folder: [bold]Loaded existing wallets[/bold] from JSON and YAML (if available).")
+
+    transactions_genesis = []
+    transactions_test = []
+
+    # 1. Gerar e registrar as carteiras
+    with console.status("[bold green]Creating and Registering Wallets..."):
+        if "Carteira1" not in wallets:
+            console.log(Panel(Text("Creating Carteira1", style="bold magenta"), border_style="blue", padding=(1, 2)))
+            private_key_1, public_key_1 = generate_keys()
+            address_1 = "Carteira1"  #Nome da Carteira
+            if register_wallet(address_1, public_key_1):
+                wallets[address_1] = {"public_key": public_key_1, "private_key": private_key_1}
+            else:
+                console.print(f"[bold red]:cross_mark: Failed to register Carteira1. Exiting.[/bold red]")
+                exit()
+        else:
+            console.log(Panel(Text("Carteira1 already exists", style="bold magenta"), border_style="blue", padding=(1, 2)))
+            address_1 = "Carteira1"
+            private_key_1 = wallets[address_1]["private_key"] #Carrega chave privada
+
+        if "Carteira2" not in wallets:
+            console.log(Panel(Text("Creating Carteira2", style="bold magenta"), border_style="blue", padding=(1, 2)))
+            private_key_2, public_key_2 = generate_keys()
+            address_2 = "Carteira2" #Nome da Carteira
+            if register_wallet(address_2, public_key_2):
+                wallets[address_2] = {"public_key": public_key_2, "private_key": private_key_2}
+            else:
+                console.print(f"[bold red]:cross_mark: Failed to register Carteira2. Exiting.[/bold red]")
+                exit()
+        else:
+            console.log(Panel(Text("Carteira2 already exists", style="bold magenta"), border_style="blue", padding=(1, 2)))
+            address_2 = "Carteira2"
+            private_key_2 = wallets[address_2]["private_key"] #Carrega chave privada
+    # Salva as carteiras
+    save_wallets(wallets)
+
+    # 2.  Criação das transações Genesis
+    console.rule(Text("Genesis Transactions", style="bold cyan"))
+    with console.status("[bold green]Creating Genesis Transactions..."):
+        genesis_tx1_data = create_transaction("", "Genesis", address_1, 10)  # Doa 10 Tokens
+        if genesis_tx1_data:
+            transactions_genesis.append(genesis_tx1_data)
+        else:
+            console.print("[bold red]:cross_mark: Failed to create Genesis transaction 1.[/bold red]")
+
+        genesis_tx2_data = create_transaction("", "Genesis", address_2, 10)  # Doa 10 Tokens
+        if genesis_tx2_data:
+            transactions_genesis.append(genesis_tx2_data)
+        else:
+            console.print("[bold red]:cross_mark: Failed to create Genesis transaction 2.[/bold red]")
+
+    # 3. Aguardar a mineração do bloco Genesis e transações de criação
+    wait_for_block()
+
+    # 4. Fazer as transações de teste
+    console.rule(Text("Test Transactions", style="bold cyan"))
+    with console.status("[bold green]Creating Test Transactions..."):
+        test_tx1_data = create_transaction(private_key_1, address_1, address_2, 5)
+        if test_tx1_data:
+            transactions_test.append(test_tx1_data)
+            wait_for_block() # Aguarda a mineração da primeira transação
+        else:
+            console.print("[bold red]:cross_mark: Failed to create Test transaction 1.[/bold red]")
+
+        test_tx2_data = create_transaction(private_key_2, address_2, address_1, 2)
+        if test_tx2_data:
+            transactions_test.append(test_tx2_data)
+            wait_for_block()  # Aguarda a mineração da segunda transação
+        else:
+            console.print("[bold red]:cross_mark: Failed to create Test transaction 2.[/bold red]")
+
+
+    # 5. Salvar dados das transações
+    console.rule(Text("Saving Transaction Data", style="bold cyan"))
+    all_transactions = {
+        "genesis_transactions": transactions_genesis,
+        "test_transactions": transactions_test
+    }
+    save_transactions_data(all_transactions, TRANSACTIONS_FILE_JSON, TRANSACTIONS_FILE_YAML)
+
+
+    console.rule(Rule(Text("Process Completed!", style="bold green")))
+    console.print(Panel(Text(":trophy: Tester v2 finished successfully! :trophy:", style="bold green"), border_style="green", padding=(1, 2)))
+```
+
+DOCUMENTAÇÃO (Docstrings):
+  def generate_keys:
+    Gera um par de chaves RSA (privada e pública).
+  def load_key:
+    Carrega uma chave RSA (privada ou pública) a partir de uma string.
+  def sign_data:
+    Registra uma carteira na blockchain.
+  def create_transaction:
+    Cria e envia uma transação assinada para a blockchain.
+  def wait_for_block:
+    Espera até que um novo bloco seja minerado com Rich Progress Bar.
+  def load_wallets:
+    Carrega as carteiras do arquivo JSON e YAML.
+  def save_wallets:
+    Salva as carteiras nos arquivos JSON e YAML com UTF-8 encoding.
+  def save_transactions_data:
+    Salva os dados das transações em JSON e YAML com UTF-8.
+
+--------------------------------------------------
+Nome do arquivo: validator.py
+Caminho completo: .\validator.py
+Tamanho (bytes): 28249
+Número de linhas: 519
+--------------------------------------------------
+
+CÓDIGO FONTE:
+```python
+import hashlib
+import json
+import time
+import requests
+import threading
+from typing import List, Optional
+
+import logging
+import random  # For exponential backoff jitter
+
+# Importe as funções necessárias do core.py
+from core import generate_keys, sign_data, is_valid_proof, Block, Transaction, proof_of_work, is_valid_chain, get_blockchain, verify_signature
+from pydantic import ValidationError # Import ValidationError for handling block deserialization errors
+
+# Importe as bibliotecas para visualização
+import colorama
+from colorama import Fore, Back, Style
+
+# Inicializa o Colorama
+colorama.init()
+
+# Configuração de Logs
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s') # Mudado para DEBUG
+logger = logging.getLogger(__name__)
+
+# Configurações
+NODE_COUNT = 3
+BASE_PORT = 17223  # A porta do primeiro nó validador
+BLOCKCHAIN_PORT = 17222  # A porta da blockchain principal
+BLOCKCHAIN_URL = f"http://localhost:{BLOCKCHAIN_PORT}"
+DIFFICULTY = 4  # Número de zeros à esquerda necessários no hash
+MINING_RATE = 10  # Segundos entre tentativas de mineração
+MAX_REGISTRATION_ATTEMPTS = 5  # Número máximo de tentativas de registro
+MAX_CONFIRMATION_FAILURES = 12  # Numero máximo de falhas de confirmação antes de abortar
+API_RETRY_MAX_ATTEMPTS = 5  # Máximo de tentativas para chamadas à API
+API_RETRY_BASE_DELAY = 2  # Delay base em segundos para backoff exponencial na API
+API_RETRY_MAX_DELAY = 30  # Delay máximo em segundos para backoff exponencial na API
+BLOCK_SYNC_INTERVAL = 30 # Intervalo para sincronização completa da blockchain (segundos)
+STARTUP_DELAY = 15 # Delay de inicialização dos validadores (segundos)
+
+# Estatísticas Globais (Sintéticas)
+total_transactions_processed = 0
+total_blocks_mined = 0
+avg_mining_time = 0.0
+mining_attempts = 0
+failed_registrations = 0  # Contador para falhas de registro
+successful_registrations = 0  # Contador para registros bem-sucedidos
+block_confirmation_errors = 0  # Contador de erros ao confirmar blocos
+api_request_errors = 0  # Contador de erros em requisições à API
+invalid_chains_received = 0 # Contador para blockchains inválidas recebidas da API
+invalid_pending_transactions = 0 # Contador para transações pendentes inválidas descartadas
+full_chain_sync_count = 0 # Contador de sincronizações completas da blockchain
+
+# Lock para proteger o acesso a variáveis globais (threadsafety)
+stats_lock = threading.Lock()
+blockchain_sync_lock = threading.Lock() # Lock para sincronização da blockchain
+
+def make_api_request(url, method='GET', json_data=None, max_attempts=API_RETRY_MAX_ATTEMPTS, base_delay=API_RETRY_BASE_DELAY, max_delay=API_RETRY_MAX_DELAY, error_detail=""):
+    """
+    Faz uma requisição à API com retry e backoff exponencial e log de erro aprimorado.
+
+    Args:
+        url (str): URL da API.
+        method (str): Método HTTP ('GET' ou 'POST').
+        json_data (dict, optional): Dados JSON para requisições POST.
+        max_attempts (int): Número máximo de tentativas.
+        base_delay (int): Delay base para backoff exponencial.
+        max_delay (int): Delay máximo para backoff exponencial.
+        error_detail (str): Detalhe adicional para logs de erro.
+
+    Returns:
+        dict or None: Resposta JSON em caso de sucesso, None em caso de falha após retries.
+    """
+    global api_request_errors  # Usa o contador global de erros de API
+
+    headers = {'Content-Type': 'application/json'}  # Define o cabeçalho para JSON explicitamente
+    log_prefix = f"API Request ({error_detail}):" if error_detail else "API Request:" # Prefixo para logs
+
+    for attempt in range(max_attempts):
+        try:
+            if method == 'GET':
+                response = requests.get(url, headers=headers)
+            elif method == 'POST':
+                response = requests.post(url, json=json_data, headers=headers)
+            else:
+                logger.error(f"🚨 {log_prefix} Método HTTP inválido: {method}")
+                return None  # Método inválido
+
+            response.raise_for_status()  # Lança exceção para status de erro HTTP
+            return response.json()  # Retorna a resposta JSON se a requisição for bem-sucedida
+
+        except requests.exceptions.RequestException as e:
+            delay = min(max_delay, base_delay * (2**attempt) + random.uniform(0, 1)) # Backoff exponencial com jitter
+            logger.warning(f"⚠️ {log_prefix} para {url} falhou (Tentativa {attempt + 1}/{max_attempts}): {e}. Retentando em {delay:.2f} segundos...")
+            time.sleep(delay)
+        except json.JSONDecodeError:
+            logger.error(f"🚨 {log_prefix} para {url}: Resposta não é JSON válida.")
+            return None # Falha ao decodificar JSON
+        except Exception as e: # Captura outras exceções inesperadas
+            logger.error(f"🚨 {log_prefix} Erro inesperado na requisição API para {url}: {e}")
+            return None
+
+    logger.error(f"❌ {log_prefix} Falha na requisição API para {url} após {max_attempts} tentativas.")
+    with stats_lock:
+        api_request_errors += 1 # Incrementa contador de erros de API
+    return None # Retorna None após todas as tentativas falharem
+
+
+def register_master_node_if_needed(node_id: int, public_key: str) -> bool:
+    """
+    Registra o nó mestre na blockchain se ainda não estiver registrado.
+
+    Args:
+        node_id (int): ID do nó.
+        public_key (str): Chave pública do nó.
+
+    Returns:
+        bool: True se registrado com sucesso ou já registrado, False se falhou após tentativas.
+    """
+    global successful_registrations, failed_registrations
+
+    is_registered = False
+    registration_attempts = 0
+
+    while not is_registered and registration_attempts < MAX_REGISTRATION_ATTEMPTS:
+        registration_attempts += 1
+        error_detail = f"Node {node_id} Registration" # Contexto para logs de erro
+
+        try:
+            master_nodes = make_api_request(f"{BLOCKCHAIN_URL}/master_nodes", method='GET', error_detail=error_detail)
+            if master_nodes is None: # Falha na requisição API
+                logger.warning(f"{Fore.YELLOW}⚠️ Node {node_id}: Falha ao obter lista de nós mestres para registro. Retentando... (Tentativa {registration_attempts}/{MAX_REGISTRATION_ATTEMPTS}){Style.RESET_ALL}")
+                continue # Já logou o erro dentro de make_api_request
+
+            if public_key not in master_nodes:
+                logger.info(f"{Fore.YELLOW}🔒 Node {node_id}: Não registrado. Registrando... (Tentativa {registration_attempts}/{MAX_REGISTRATION_ATTEMPTS}){Style.RESET_ALL}")
+                registration_response = make_api_request(f"{BLOCKCHAIN_URL}/register_node", method='POST', json_data={"public_key": public_key}, error_detail=error_detail)
+                if registration_response and registration_response.get("message") == "Nó mestre registrado com sucesso.":
+                    with stats_lock:
+                        successful_registrations += 1
+                    logger.info(f"{Fore.GREEN}✅ Node {node_id}: Registrado com sucesso!{Style.RESET_ALL}")
+                    is_registered = True
+                else:
+                    logger.error(f"{Fore.RED}🚨 Node {node_id}: Falha ao registrar nó mestre (Tentativa {registration_attempts}/{MAX_REGISTRATION_ATTEMPTS}). Resposta inesperada: {registration_response}{Style.RESET_ALL}")
+                    with stats_lock:
+                        failed_registrations += 1
+            else:
+                logger.info(f"{Fore.GREEN}✅ Node {node_id}: Já registrado.{Style.RESET_ALL}")
+                is_registered = True
+                break # Sai do loop se já registrado
+
+        except Exception as e: # Captura erros gerais, logs mais genéricos aqui
+            logger.error(f"{Fore.RED}🚨 Node {node_id}: Erro inesperado ao registrar nó mestre (Tentativa {registration_attempts}/{MAX_REGISTRATION_ATTEMPTS}): {e}{Style.RESET_ALL}")
+            with stats_lock:
+                failed_registrations += 1
+            time.sleep(MINING_RATE * 2) # Espera mais em caso de erro inesperado, antes de retentar
+
+    if not is_registered:
+        logger.error(f"{Fore.RED}❌ Node {node_id}: Falha ao registrar nó mestre após {MAX_REGISTRATION_ATTEMPTS} tentativas.{Style.RESET_ALL}")
+        return False
+    return True
+
+def sync_blockchain_from_api(node_id: int) -> Optional[List[Block]]:
+    """
+    Sincroniza a blockchain completa da API.
+
+    Args:
+        node_id (int): ID do nó que está sincronizando.
+
+    Returns:
+        Optional[List[Block]]: A blockchain sincronizada como lista de objetos Block, ou None em caso de falha.
+    """
+    global full_chain_sync_count, invalid_chains_received # Access global counters
+
+    logger.info(f"{Fore.CYAN}🔄 Node {node_id}: Sincronizando blockchain completa da API...{Style.RESET_ALL}")
+    error_detail = f"Node {node_id} Full Chain Sync" # Contexto para logs de erro
+
+    blockchain_json = make_api_request(f"{BLOCKCHAIN_URL}/blockchain", method='GET', error_detail=error_detail)
+    if blockchain_json is None:
+        logger.warning(f"⚠️ Node {node_id}: Falha ao obter blockchain para sincronização.")
+        return None
+
+    try:
+        blockchain = [Block(**block_data) for block_data in blockchain_json] # Desserializa para objetos Block
+    except ValidationError as e:
+        logger.error(f"{Fore.RED}🚨 Node {node_id}: Erro de validação ao desserializar blockchain da API durante sincronização: {e}{Style.RESET_ALL}")
+        return None
+
+    if not is_valid_chain(blockchain): # Valida a cadeia sincronizada
+        logger.error(f"{Fore.RED}🚨 Node {node_id}: Blockchain sincronizada da API é inválida! Descartando.{Style.RESET_ALL}")
+        with stats_lock:
+            invalid_chains_received += 1
+        return None
+
+    with stats_lock:
+        full_chain_sync_count += 1 # Incrementa contador de sincronizações bem-sucedidas
+    logger.info(f"{Fore.GREEN}✅ Node {node_id}: Blockchain sincronizada com sucesso. Chain size: {len(blockchain)} blocks.{Style.RESET_ALL}")
+    return blockchain # Retorna a blockchain sincronizada
+
+def get_latest_blockchain_data(node_id: int, blockchain_cache: dict) -> tuple[Optional[List[Block]], Optional[str], Optional[int]]:
+    """
+    Obtém os dados mais recentes da blockchain (blockchain completa, último hash e index) usando cache.
+
+    Args:
+        node_id (int): ID do nó.
+        blockchain_cache (dict): Cache da blockchain para este nó.
+
+    Returns:
+        tuple: (blockchain, previous_hash, last_block_index) ou (None, None, None) em caso de erro.
+    """
+    if blockchain_cache and 'blockchain' in blockchain_cache and 'last_update' in blockchain_cache:
+        if time.time() - blockchain_cache['last_update'] <= BLOCK_SYNC_INTERVAL:
+            logger.debug(f"Node {node_id}: Usando blockchain do cache.")
+            blockchain = blockchain_cache['blockchain']
+            if blockchain:
+                last_block = blockchain[-1]
+                previous_hash = last_block.hash
+                index = last_block.index + 1
+            else: # Blockchain vazia
+                previous_hash = "0"
+                index = 0
+            return blockchain, previous_hash, index
+
+
+    # Se o cache estiver vencido ou vazio, sincroniza a blockchain completa
+    with blockchain_sync_lock: # Garante que apenas um nó sincronize por vez
+        blockchain = sync_blockchain_from_api(node_id) # Sincroniza a blockchain completa da API
+        if blockchain:
+             blockchain_cache['blockchain'] = blockchain # Atualiza o cache com a blockchain completa
+             blockchain_cache['last_update'] = time.time() # Atualiza o timestamp do cache
+             logger.debug(f"Node {node_id}: Blockchain cache atualizado.")
+
+
+    if blockchain:
+        last_block = blockchain[-1]
+        previous_hash = last_block.hash # Usa o hash do objeto Block diretamente
+        index = last_block.index + 1
+    else: # Blockchain vazia or falha na sincronização
+        logger.warning(f"⚠️ Node {node_id}: Blockchain vazia detectada after sync.") # More specific warning
+        logger.info(f"ℹ️ Node {node_id}: Starting with empty blockchain - proceeding to mine Genesis (or next block).") # Info log
+        return [], "0", 0 # Return empty blockchain, Genesis previous_hash, index 0
+
+
+    return blockchain, previous_hash, index
+
+
+def get_pending_transactions_from_api(node_id: int) -> Optional[List[Transaction]]: # Mudança no tipo de retorno para List[Transaction]
+    """
+    Obtém as transações pendentes da API e as valida.
+
+    Args:
+        node_id (int): ID do nó.
+
+    Returns:
+        Optional[List[Transaction]]: Lista de transações pendentes validadas ou None em caso de erro.
+    """
+    global invalid_pending_transactions # Access global counter
+
+    error_detail = f"Node {node_id} Pending TX Fetch" # Contexto para logs de erro
+    pending_transactions_json = make_api_request(f"{BLOCKCHAIN_URL}/pending_transactions", method='GET', error_detail=error_detail)
+
+    if pending_transactions_json is None: # Falha na requisição API já tratada em make_api_request
+        logger.warning(f"⚠️ Node {node_id}: Falha ao obter transações pendentes da API.")
+        return None
+
+    valid_transactions = []
+    if pending_transactions_json:
+        for tx_data in pending_transactions_json:
+            try:
+                transaction = Transaction(**tx_data) # Cria objeto Transaction
+                if verify_transaction_signature_validator(transaction): # Valida a transação (usando função local!)
+                    valid_transactions.append(transaction)
+                else:
+                    logger.warning(f"{Fore.YELLOW}⚠️ Node {node_id}: Transação pendente inválida (assinatura falhou), descartando: {transaction}{Style.RESET_ALL}")
+                    with stats_lock:
+                        invalid_pending_transactions += 1 # Increment invalid transaction counter
+
+            except ValidationError as e:
+                logger.error(f"{Fore.RED}🚨 Node {node_id}: Erro de validação ao desserializar transação pendente da API, descartando: {e} Data: {tx_data}{Style.RESET_ALL}")
+                with stats_lock:
+                    invalid_pending_transactions += 1 # Increment invalid transaction counter
+            except Exception as e:
+                logger.error(f"{Fore.RED}🚨 Node {node_id}: Erro inesperado ao processar transação pendente, descartando. Erro: {e}, Data: {tx_data}{Style.RESET_ALL}")
+                with stats_lock:
+                    invalid_pending_transactions += 1 # Increment invalid transaction counter
+
+    return valid_transactions # Retorna apenas as transações validas
+
+def verify_transaction_signature_validator(transaction: Transaction) -> bool:
+    """
+    Verifica a assinatura de uma transação (função local do validador para evitar dependência circular).
+    **IMPORTANTE:** Duplica a lógica de verificação de assinatura de core.py para isolamento.
+    """
+    try:
+        # Se a transação for do Genesis, ignore a verificação
+        if transaction.sender == "Genesis": # Usar GENESIS_ADDRESS se definido como global em validator.py
+            return True
+
+        # Prepare os dados para verificação (sem a assinatura)
+        data = f"{transaction.sender}{transaction.recipient}{transaction.amount}"
+        signature_bytes = bytes.fromhex(transaction.signature)
+
+        # **Requisita a chave publica da API** - Validador busca chave publica direto da API para maior segurança
+        error_detail = f"Node - {transaction.sender} Public Key Fetch" # Contexto para logs de erro
+        public_key_pem_response = make_api_request(f"{BLOCKCHAIN_URL}/get_public_key/{transaction.sender}", method='GET', error_detail=error_detail) # Rota da API para buscar chave publica por address
+
+        if not public_key_pem_response or not public_key_pem_response.get('public_key'):
+            logger.warning(f"Chave pública não encontrada na API para o endereço: {transaction.sender}")
+            return False
+        public_key_pem = public_key_pem_response['public_key']
+
+
+        return verify_signature(public_key_pem, signature_bytes, data) # Reutiliza verify_signature (já importada de core.py)
+    except Exception as e:
+        logger.error(f"Erro ao verificar assinatura da transação no validador: {e}")
+        return False
+
+
+def construct_and_mine_block(node_id: int, index: int, timestamp: float, pending_transactions: List[Transaction], previous_hash: str, miner_address: str) -> Block:
+    """
+    Constrói e minera um novo bloco.
+
+    Args:
+        node_id (int): ID do nó.
+        index (int): Índice do bloco.
+        timestamp (float): Timestamp do bloco.
+        pending_transactions (List[Transaction]): Transações pendentes.
+        previous_hash (str): Hash do bloco anterior.
+        miner_address (str): Endereço do minerador.
+
+    Returns:
+        Block: Bloco minerado.
+    """
+    start_time = time.time()
+
+    new_block = Block(
+        index=index,
+        timestamp=timestamp,
+        transactions=pending_transactions,
+        previous_hash=previous_hash,
+        nonce=0,
+        miner=miner_address,
+        master_node_signatures=[]
+    )
+
+    logger.info(f"{Fore.BLUE}⛏️ Node {node_id}: Minerando bloco {new_block.index}...{Style.RESET_ALL}")
+
+    # Proof of Work (Mineração)
+    nonce = proof_of_work(new_block) # <--- Get the nonce from PoW
+    new_block.nonce = nonce # <--- Set the nonce in the block
+
+    end_time = time.time()
+    mining_time = end_time - start_time
+    logger.info(f"Node {node_id}: Bloco {new_block.index} minerado em {mining_time:.2f} segundos. Nonce: {new_block.nonce}")
+
+    with stats_lock:
+        global avg_mining_time, total_blocks_mined, mining_attempts # Declara globais aqui
+        mining_attempts += 1
+        total_blocks_mined += 1
+        avg_mining_time = (avg_mining_time * (total_blocks_mined - 1) + mining_time) / total_blocks_mined if total_blocks_mined > 0 else mining_time # Calcula média móvel
+
+    return new_block
+
+def sign_and_confirm_block(node_id: int, block: Block, block_hash: str, private_key: str, public_key: str) -> bool:
+    """
+    Assina e envia o bloco minerado para confirmação.
+
+    Args:
+        node_id (int): ID do nó.
+        block (Block): Bloco minerado.
+        block_hash (str): Hash do bloco.
+        private_key (str): Chave privada do nó.
+        public_key (str): Chave pública do nó.
+
+    Returns:
+        bool: True se a confirmação for bem-sucedida, False se falhar.
+    """
+    global block_confirmation_errors
+
+    try:
+        signature = sign_data(private_key, block_hash) # Assina o hash, não o bloco inteiro
+    except Exception as e: # Captura erros ao assinar
+        logger.error(f"{Fore.RED}🚨 Node {node_id}: Erro ao assinar o bloco: {e}{Style.RESET_ALL}")
+        return False
+
+    confirmation_data = {
+        "block": block.dict(), # Envia o bloco completo
+        "block_hash": block_hash, # Envia o hash separadamente (redundante, mas claro)
+        "signature": signature.hex(),
+        "public_key": public_key
+    }
+
+    logger.debug(f"Node {node_id}: Hash before confirmation send: {block_hash}") # Log hash BEFORE sending confirmation
+    logger.debug(f"Node {node_id}: Block before confirmation send: {confirmation_data['block']}") # Log block data BEFORE sending confirmation
+
+    error_detail = f"Node {node_id} Block Confirmation" # Contexto para logs de erro
+    confirmation_response = make_api_request(f"{BLOCKCHAIN_URL}/confirm_block", method='POST', json_data=confirmation_data, error_detail=error_detail)
+    if confirmation_response and confirmation_response.get("message") and "adicionado à blockchain com consenso" in confirmation_response.get("message"):
+        logger.info(f"{Fore.GREEN}✅ Node {node_id}: Bloco {block.index} confirmado e adicionado à blockchain: {confirmation_response}{Style.RESET_ALL}")
+        return True # Confirmação bem-sucedida
+    else:
+        error_detail_resp = confirmation_response.get("detail") if confirmation_response and confirmation_response.get("detail") else "Resposta da API sem detalhes"
+        logger.error(f"{Fore.RED}🚨 Node {node_id}: Erro ao confirmar bloco. Resposta da API: {confirmation_response}. Detalhes: {error_detail_resp}{Style.RESET_ALL}")
+        with stats_lock:
+            block_confirmation_errors += 1
+        return False # Falha na confirmação
+
+def create_and_mine_block_for_node(node_id: int, port: int, private_key: str, public_key: str, blockchain_cache: dict):
+    """
+    Função principal para o loop de mineração de um nó validador.
+
+    Args:
+        node_id (int): ID do nó.
+        port (int): Porta do nó (não usada diretamente aqui, mas pode ser útil para logs ou extensões futuras).
+        private_key (str): Chave privada do nó.
+        public_key (str): Chave pública do nó.
+        blockchain_cache (dict): Cache local da blockchain para este nó.
+    """
+    global successful_registrations, failed_registrations, total_transactions_processed, total_blocks_mined, avg_mining_time, mining_attempts, block_confirmation_errors, invalid_chains_received, invalid_pending_transactions # Inclui novos contadores globais
+
+    miner_address = f"Node{node_id}"  # Identificador do minerador
+    logger.info(f"{Fore.GREEN}✨ Node {node_id}: Iniciando mineração na porta {port}...{Style.RESET_ALL}")
+
+    confirmation_failures_local = 0 # Contador local de falhas de confirmação
+    time.sleep(STARTUP_DELAY) # ADD STARTUP DELAY HERE - Wait before starting mining loop
+
+
+    if not register_master_node_if_needed(node_id, public_key): # Registra e sai se falhar repetidamente
+        logger.error(f"{Fore.RED}❌ Node {node_id}: Falha ao registrar nó mestre. Abortando mineração.{Style.RESET_ALL}")
+        return
+
+    while True:
+        blockchain, previous_hash, index = get_latest_blockchain_data(node_id, blockchain_cache) # Obtém dados da blockchain (usando cache)
+
+        if blockchain is None: # Falha ao obter blockchain, espera e retenta
+            logger.warning(f"⚠️ Node {node_id}: Falha ao obter dados da blockchain. Esperando {MINING_RATE} segundos e retentando...")
+            time.sleep(MINING_RATE)
+            continue # Volta para o início do loop
+
+
+        pending_transactions = get_pending_transactions_from_api(node_id) # Obtém transações pendentes
+        if pending_transactions is None: # Falha ao obter transações, espera e retenta
+            logger.warning(f"⚠️ Node {node_id}: Falha ao obter transações pendentes. Esperando {MINING_RATE} segundos e retentando...")
+            time.sleep(MINING_RATE)
+            continue # Volta para o início do loop
+
+        if not pending_transactions:
+            logger.info(f"😴 {Fore.YELLOW}Node {node_id}: Nenhuma transação pendente válida. Esperando...{Style.RESET_ALL}")
+            time.sleep(MINING_RATE)
+            continue # Volta para o início do loop se não houver transações
+
+        with stats_lock:
+            total_transactions_processed += len(pending_transactions) # Atualiza contador global de transações processadas
+
+        try:
+            new_block = construct_and_mine_block(node_id, index, time.time(), pending_transactions, previous_hash, miner_address) # Constrói e minera bloco
+            block_hash = new_block.compute_hash() # Calcula o hash do bloco MINERADO (agora)
+
+            if sign_and_confirm_block(node_id, new_block, block_hash, private_key, public_key): # Assina e confirma bloco
+                confirmation_failures_local = 0 # Reseta contador de falhas de confirmação em caso de sucesso
+            else:
+                confirmation_failures_local += 1 # Incrementa se falha na confirmação
+        except Exception as e: # Captura exceções durante a mineração ou confirmação (PoW, assinatura, etc.)
+            logger.error(f"{Fore.RED}🚨 Node {node_id}: Erro durante mineração ou confirmação do bloco: {e}{Style.RESET_ALL}")
+            confirmation_failures_local += 1 # Incrementa falhas em caso de erro geral
+            with stats_lock:
+                block_confirmation_errors += 1 # Incrementa contador global de erros de confirmação
+
+
+        if confirmation_failures_local > MAX_CONFIRMATION_FAILURES: # Aborta se exceder o limite de falhas de confirmação
+            logger.critical(f"{Fore.RED}🔥 Node {node_id}: Excedeu o número máximo de falhas de confirmação ({MAX_CONFIRMATION_FAILURES}). Abortando mineração.{Style.RESET_ALL}")
+            break # Sai do loop de mineração se muitas falhas
+
+        time.sleep(MINING_RATE) # Espera antes da próxima iteração
+
+# Iniciar os nós validadores em threads
+if __name__ == "__main__":
+    # Cache da blockchain para cada nó
+    blockchain_caches = {}
+    # Gerar chaves RSA para cada nó
+    keys = [generate_keys() for _ in range(NODE_COUNT)]
+    threads = []
+    for i in range(NODE_COUNT):
+        port = BASE_PORT + i
+        node_id = i + 1
+        private_key, public_key = keys[i]
+        blockchain_caches[node_id] = {} # Inicializa cache para o nó
+        thread = threading.Thread(target=create_and_mine_block_for_node, args=(node_id, port, private_key, public_key, blockchain_caches[node_id])) # Passa o cache para a thread
+        threads.append(thread)
+        thread.start()
+
+    # Função para exibir as métricas
+    def display_metrics():
+        while True:
+            # Access stats
+            with stats_lock:
+                global total_blocks_mined, avg_mining_time, mining_attempts, block_confirmation_errors, successful_registrations, failed_registrations, api_request_errors, invalid_chains_received, invalid_pending_transactions, full_chain_sync_count # Inclui novos contadores globais
+                logger.info(f"\n{Fore.CYAN}📊 Blockchain Metrics:{Style.RESET_ALL}")
+                logger.info(f"{Fore.MAGENTA}   Total Blocks Mined: {total_blocks_mined}{Style.RESET_ALL}")
+                logger.info(f"{Fore.MAGENTA}   Total Transactions Processed: {total_transactions_processed}{Style.RESET_ALL}")
+                logger.info(f"{Fore.MAGENTA}   Avg. Mining Time: {avg_mining_time:.2f} s{Style.RESET_ALL}")
+                logger.info(f"{Fore.MAGENTA}   Total Mining Attempts: {mining_attempts}{Style.RESET_ALL}")
+                logger.info(f"{Fore.RED}   Failed Registrations: {failed_registrations}{Style.RESET_ALL}")
+                logger.info(f"{Fore.GREEN}   Successful Registrations: {successful_registrations}{Style.RESET_ALL}")
+                logger.info(f"{Fore.RED}   Block Confirmation Errors: {block_confirmation_errors}{Style.RESET_ALL}")
+                logger.info(f"{Fore.YELLOW}   API Request Errors: {api_request_errors}{Style.RESET_ALL}") # Nova métrica para erros de API
+                logger.info(f"{Fore.RED}   Invalid Chains Received: {invalid_chains_received}{Style.RESET_ALL}") # Nova métrica para cadeias inválidas
+                logger.info(f"{Fore.RED}   Invalid Pending Transactions: {invalid_pending_transactions}{Style.RESET_ALL}") # Nova métrica para transações pendentes inválidas
+                logger.info(f"{Fore.CYAN}   Full Chain Syncs: {full_chain_sync_count}{Style.RESET_ALL}\n") # Nova métrica para full syncs
+
+            time.sleep(5.0)  # Update metrics display every 5 segundos (menos frequente)
+
+    # Create a thread to display metrics in real-time
+    metrics_thread = threading.Thread(target=display_metrics)
+    metrics_thread.daemon = True  # Allow the thread to exit when the program exits
+    metrics_thread.start()
+
+    for thread in threads:
+        thread.join() # Keep the main thread alive
+```
+
+DOCUMENTAÇÃO (Docstrings):
+  def make_api_request:
+    Faz uma requisição à API com retry e backoff exponencial e log de erro aprimorado.
+
+    Args:
+        url (str): URL da API.
+        method (str): Método HTTP ('GET' ou 'POST').
+        json_data (dict, optional): Dados JSON para requisições POST.
+        max_attempts (int): Número máximo de tentativas.
+        base_delay (int): Delay base para backoff exponencial.
+        max_delay (int): Delay máximo para backoff exponencial.
+        error_detail (str): Detalhe adicional para logs de erro.
+
+    Returns:
+        dict or None: Resposta JSON em caso de sucesso, None em caso de falha após retries.
+  def register_master_node_if_needed:
+    Função principal para o loop de mineração de um nó validador.
+
+    Args:
+        node_id (int): ID do nó.
+        port (int): Porta do nó (não usada diretamente aqui, mas pode ser útil para logs ou extensões futuras).
+        private_key (str): Chave privada do nó.
+        public_key (str): Chave pública do nó.
+        blockchain_cache (dict): Cache local da blockchain para este nó.
+
+==================================================
+              FIM DA DOCUMENTAÇÃO                   
+==================================================
