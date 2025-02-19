@@ -58,9 +58,6 @@ MyChain adota uma arquitetura em camadas cuidadosamente projetada para garantir 
     *   Confirmar os blocos minerados através do protocolo de consenso 🤝
     Os nós validadores são projetados para serem altamente resilientes e tolerantes a falhas, garantindo que a blockchain continue a operar mesmo em caso de ataques ou interrupções.
 
-<p align="center">
-  <img src="https://miro.medium.com/v2/resize:fit:1400/1*b_jK2K3H9_5-W8cTujjG3Q.png" alt="Blockchain Arquitetura Exemplo" width="500">
-</p>
 
 ## ⚙️ Componentes Chave Detalhados 🔑
 
