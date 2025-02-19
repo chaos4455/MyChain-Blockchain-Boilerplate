@@ -1,9 +1,5 @@
 # 🔗 MyChain: Uma Plataforma Blockchain Modular para Soluções Empresariais 🚀
 
-[![GitHub Stars](https://img.shields.io/github/stars/chaos4455/seu-repo?style=social)](https://github.com/chaos4455/seu-repo)
-[![GitHub Forks](https://img.shields.io/github/forks/chaos4455/seu-repo?style=social)](https://github.com/chaos4455/seu-repo)
-[![GitHub Issues](https://img.shields.io/github/issues/chaos4455/seu-repo)](https://github.com/chaos4455/seu-repo/issues)
-[![GitHub Pull Requests](https://img.shields.io/github/pulls/chaos4455/seu-repo)](https://github.com/chaos4455/seu-repo/pulls)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-green.svg)](https://www.python.org/downloads/)
@@ -13,9 +9,7 @@
 [![RSA Encryption](https://img.shields.io/badge/RSA-Secure-green)](https://en.wikipedia.org/wiki/RSA_(cryptosystem))
 [![PoW](https://img.shields.io/badge/Proof--of--Work-Mining-green)](https://en.wikipedia.org/wiki/Proof_of_work)
 
-<p align="center">
-  <img src="https://user-images.githubusercontent.com/seu-usuario/seu-repo/blob/main/images/blockchain_diagram.png" alt="Blockchain Architecture Diagram" width="700">
-</p>
+
 
 ## 💡 Visão Geral
 
