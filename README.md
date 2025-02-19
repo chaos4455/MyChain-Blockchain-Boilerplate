@@ -10,6 +10,10 @@
 [![PoW](https://img.shields.io/badge/Proof--of--Work-Mining-green)](https://en.wikipedia.org/wiki/Proof_of_work)
 
 
+![dcf897fd9cf34672adbbdaec4d6c9d44](https://github.com/user-attachments/assets/a0ad9f03-dfe7-45bc-b6a9-d39370b10f88)
+
+![1c6aff46-0b9f-4aeb-ba04-9b3590f05bcf](https://github.com/user-attachments/assets/a4d85af3-3641-4551-8cff-d5aef025a549)
+
 
 ## 💡 Visão Geral
 
