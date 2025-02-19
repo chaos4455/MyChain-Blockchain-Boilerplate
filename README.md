@@ -17,7 +17,7 @@
 
 ## 💡 Visão Geral
 
-Como Elias Andrade 👨‍💻, visionário por trás do MyChain, apresento uma plataforma blockchain concebida para transcender as limitações das soluções convencionais. MyChain não é apenas um projeto; é o resultado da minha paixão em desmistificar a tecnologia blockchain e torná-la acessível para aplicações empresariais de alto impacto. 🎯
+sou Elias Andrade 👨‍💻, visionário por trás do MyChain, apresento uma plataforma blockchain concebida para transcender as limitações das soluções convencionais. MyChain não é apenas um projeto; é o resultado da minha paixão em desmistificar a tecnologia blockchain e torná-la acessível para aplicações empresariais de alto impacto. 🎯
 
 Na essência, MyChain visa oferecer uma infraestrutura blockchain flexível 🧰, segura 🔒 e escalável 📈, projetada para se adaptar às necessidades específicas de cada cliente. Através de uma arquitetura modular e um design intuitivo, MyChain permite a criação de soluções descentralizadas personalizadas que podem revolucionar a forma como as empresas operam e interagem com seus stakeholders. 🤝
 
