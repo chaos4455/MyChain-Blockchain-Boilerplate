@@ -62,6 +62,65 @@ MyChain adota uma arquitetura em camadas cuidadosamente projetada para garantir 
     *   Confirmar os blocos minerados através do protocolo de consenso 🤝
     Os nós validadores são projetados para serem altamente resilientes e tolerantes a falhas, garantindo que a blockchain continue a operar mesmo em caso de ataques ou interrupções.
 
+## ✨ Atualização Recente do Boilerplate Tokenomics & Blockchain (22/05/2025) ✨
+
+[![Status: Em Desenvolvimento](https://img.shields.io/badge/Status-Em%20Desenvolvimento-yellow?style=for-the-badge)](https://github.com/seu-usuario/seu-repo)
+
+🔨 **Em Desenvolvimento Ativo:** Este projeto tem estado em desenvolvimento intenso nos últimos 4 dias, com inúmeras atualizações e upgrades implementados!  Estamos trabalhando arduamente para trazer as funcionalidades mais recentes para este boilerplate.
+
+🚀 **Principais Atualizações e Upgrades:**
+
+* ✅ **Suporte a Smart Contracts:** A blockchain agora é totalmente compatível com a implantação e execução de contratos inteligentes, abrindo um leque de possibilidades para aplicações descentralizadas (dApps).
+* 📁 **Armazenamento de Arquivos On-Chain:**  Integramos um sistema de armazenamento de arquivos diretamente na blockchain, permitindo soluções descentralizadas de armazenamento e gestão de dados.
+* 🔒 **Criptografia Ponta a Ponta Reforçada:**  Implementamos criptografia de ponta a ponta robusta em toda a rede blockchain:
+    * 🛡️ **Transações:** Todas as transações são criptografadas de ponta a ponta, garantindo a confidencialidade dos dados.
+    * 📡 **Comunicação entre Nodos:** A comunicação entre os nodos da rede é totalmente criptografada, protegendo a integridade da blockchain.
+    * 🔑 **API Gateway:**  A comunicação com a API Gateway também é criptografada, assegurando a segurança do acesso externo.
+* ⚙️ **Consenso Híbrido PoS e PoW:**  O mecanismo de consenso foi aprimorado para um modelo híbrido, combinando Proof-of-Stake (PoS) e Proof-of-Work (PoW) para maior segurança e eficiência.
+* 💰 **Motor de Tokenomics Aprimorado:**  Nosso sistema de tokenomics agora inclui:
+    * 💸 **Recompensas:**  Distribuição de recompensas para participantes da rede (validadores, mineradores, etc.).
+    * 🧾 **Taxas e Compensações:**  Implementação de taxas de transação e mecanismos de compensação para otimizar a economia do token.
+* ⏰ **Smart Contracts Agendados:**  Capacidade de executar smart contracts de forma agendada, permitindo automação e lógica complexa baseada em tempo.
+* 🌐 **API RESTful para Gerenciamento de Carteiras:**  Disponibilizamos uma API RESTful completa para gerenciamento de carteiras, facilitando a integração com outras aplicações e serviços.
+
+🚧 **Código Fonte Atualizado em Breve:**  É importante notar que o código fonte mais recente, refletindo todas estas atualizações, **ainda não foi publicado neste repositório**.  Estamos trabalhando para preparar o código e atualizá-lo o mais rápido possível. Fique atento!
+
+🚀 **Próximos Passos e Roadmap Futuro:**
+
+* 📱 **Desenvolvimento de E-Wallet:**  Planejamos desenvolver uma e-wallet amigável para facilitar a interação dos usuários com a blockchain.
+* 💻 **Web App com Vite, React, Shadcn UI e Tailwind CSS:**  Para uma experiência de usuário completa, estamos projetando um web app moderno e responsivo utilizando:
+    *  [Vite](https://vitejs.dev/) - Para um desenvolvimento rápido e eficiente.
+    *  [React](https://reactjs.org/) - Para uma interface de usuário dinâmica e interativa.
+    *  [Shadcn UI](https://ui.shadcn.com/) - Para componentes de interface de usuário elegantes e acessíveis.
+    *  [Tailwind CSS](https://tailwindcss.com/) - Para estilização rápida e consistente.
+
+Agradecemos a sua paciência e interesse neste projeto! Em breve teremos o código fonte atualizado disponível. 😉
+
+### 🔍 Monitoramento e Debugging Detalhado 🔍
+
+Nossas aplicações são construídas com um forte foco em **observabilidade**.  Implementamos logs altamente detalhados em todos os níveis - desde a **API**, passando pelos **serviços**, até o **core da blockchain**.  Para facilitar o desenvolvimento e a depuração, oferecemos:
+
+* 🖥️ **Console App em Tempo Real:**  Acompanhe o fluxo da aplicação e identifique problemas instantaneamente com nossa console application.  Ative o modo debug e veja logs detalhados e mensagens de depuração em tempo real, diretamente no console.
+* 🪵 **Logs Abrangentes:**  Registramos cada passo crítico, permitindo um rastreamento completo do comportamento da aplicação e facilitando a identificação e resolução de qualquer issue.
+
+Com nossas ferramentas de monitoramento, você terá visibilidade total do que acontece "por baixo dos panos" e poderá depurar e otimizar sua aplicação de forma eficiente.
+
+<img width="441" alt="mintty_xUmXpv77Iw" src="https://github.com/user-attachments/assets/6ff03be3-ee57-4b16-a9ea-667cceab2761" />
+
+<img width="816" alt="Cursor_2rO1DQadda" src="https://github.com/user-attachments/assets/453cc5e1-735e-425f-8d73-9649f7f98416" />
+
+<img width="342" alt="Cursor_AcPFki91j5" src="https://github.com/user-attachments/assets/280a5158-9c4b-4284-8e26-0e084f1514cc" />
+
+<img width="378" alt="Cursor_5HxavRULAi" src="https://github.com/user-attachments/assets/278c0b81-5cb3-4f37-8957-45ba18c47ede" />
+
+<img width="426" alt="Cursor_nWzxNRAkiZ" src="https://github.com/user-attachments/assets/1fd46603-b5c9-40c6-9f8c-d96d85036b73" />
+
+<img width="231" alt="Cursor_OxOBYIztEt" src="https://github.com/user-attachments/assets/8bdb091b-38e0-4bcf-9b3d-4193f10c84b0" />
+
+<img width="1920" alt="chrome_tENbnPVh14" src="https://github.com/user-attachments/assets/1ef9eea9-8558-4e3d-ab38-fb2b36df0186" />
+
+<img width="1311" alt="chrome_zLQJ4BO63i" src="https://github.com/user-attachments/assets/a15f5188-7de9-431e-8a72-f9aac21c26be" />
+
 
 ## ⚙️ Componentes Chave Detalhados 🔑
 
